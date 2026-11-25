@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bảng điều khiển Agent</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='6' fill='%2318181b'/><path d='M7 12h3l2-4 2 8 2-4h1' stroke='white' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"><svg class="i sm" viewBox="0 0 24 24"><path d="M4 12h4l2.5-5 3 10 2.5-5h4"/></svg></span>
+      Bảng điều khiển Agent
+    </div>
+    <nav class="tabs" role="tablist">
+      <button class="tab" data-tab="live" role="tab">Hoạt động <span class="tab-badge" id="badge-live" hidden></span></button>
+      <button class="tab" data-tab="team" role="tab">Agent &amp; Skill</button>
+      <button class="tab" data-tab="settings" role="tab">Cài đặt</button>
+    </nav>
+    <button class="conn" id="conn" title="Trạng thái kết nối"></button>
+  </header>
+
+  <section id="approvals" class="approvals" hidden></section>
+
+  <main>
+    <section id="view-live" class="view"></section>
+    <section id="view-team" class="view page" hidden></section>
+    <section id="view-settings" class="view page" hidden></section>
+  </main>
+
+  <aside id="drawer" class="drawer" aria-hidden="true">
+    <div class="drawer-panel" id="drawer-panel"></div>
+  </aside>
+  <div id="modal" class="modal" hidden></div>
+  <div id="toasts" class="toasts"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "name": "agent-dashboard",
+  "version": "1.0.0",
+  "description": "Bảng điều khiển trực quan cho các agent, skill và sub-agent của Claude Code",
+  "private": true,
+  "license": "MIT",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
