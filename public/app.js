@@ -316,12 +316,22 @@ document.addEventListener('click', e => {
 // ================================================================== flow model
 // Turns a session's step list into "turns" (one per request). Each turn is a grid of nodes:
 // column 0 = main agent, columns 1.. = sub-agents (a column is reused once its agent is done).
+// Rows are packed per column, so agents working in parallel sit side by side on the same rows;
+// a node only moves down when it has to wait for something (a fork, a returning agent).
 function buildTurns(s) {
   const agents = new Map((s.agents || []).map(a => [a.key, a]));
   const turns = [];
   const forkOf = new Map();
   let T = null;
-  const add = n => { n.id = `${n.type}-${n.steps[0].id}`; n.row = T.row++; T.nodes.push(n); T.cols = Math.max(T.cols, n.col + 1); return n; };
+  const add = (n, minRow = 0) => {
+    n.id = `${n.type}-${n.steps[0].id}`;
+    n.row = Math.max(T.colRow[n.col] || 1, minRow);
+    T.colRow[n.col] = n.row + 1;
+    T.maxRow = Math.max(T.maxRow, n.row);
+    T.nodes.push(n);
+    T.cols = Math.max(T.cols, n.col + 1);
+    return n;
+  };
   const edge = (a, b, kind, lane) => T.edges.push({ from: a.id, to: b.id, kind, lane });
   const chain = (lane, n) => { const prev = T.last.get(lane); if (prev) edge(prev, n, 'seq', lane); T.last.set(lane, n); };
   const colFor = lane => {
@@ -331,7 +341,7 @@ function buildTurns(s) {
     return c;
   };
   const newTurn = prompt => {
-    T = { key: prompt ? prompt.id : `t${turns.length}`, prompt, nodes: [], edges: [], row: 1, cols: 1, laneCol: new Map(), colOwner: [], last: new Map(), steps: 0, agents: new Set(), ts: prompt?.ts };
+    T = { key: prompt ? prompt.id : `t${turns.length}`, prompt, nodes: [], edges: [], colRow: [], maxRow: 0, cols: 1, laneCol: new Map(), colOwner: [], last: new Map(), steps: 0, agents: new Set(), ts: prompt?.ts };
     turns.push(T);
     if (prompt) T.last.set(null, add({ type: 'prompt', lane: null, col: 0, steps: [prompt] }));
   };
@@ -344,13 +354,11 @@ function buildTurns(s) {
     if (st.mark === 'subagent-start' && lane) {
       const fresh = !T.laneCol.has(lane);
       const ag = agents.get(lane);
-      const n = add({ type: 'lane-start', lane, col: colFor(lane), steps: [st], agent: ag });
-      if (fresh) {
-        const f = ag?.toolUseId && forkOf.get(ag.toolUseId);
-        const src = f && T.nodes.includes(f) ? f : T.last.get(null);
-        if (src) edge(src, n, 'fork', lane);
-        T.last.set(lane, n);
-      } else chain(lane, n);
+      const col = colFor(lane);
+      const f = ag?.toolUseId && forkOf.get(ag.toolUseId);
+      const src = fresh ? (f && T.nodes.includes(f) ? f : T.last.get(null)) : null;
+      const n = add({ type: 'lane-start', lane, col, steps: [st], agent: ag }, src ? src.row + 1 : 0);
+      if (src) { edge(src, n, 'fork', lane); T.last.set(lane, n); } else chain(lane, n);
       continue;
     }
     if (st.mark === 'subagent-end' && lane) {
@@ -359,22 +367,26 @@ function buildTurns(s) {
       const end = add({ type: 'lane-end', lane, col: T.laneCol.get(lane), steps: [st], agent: ag });
       chain(lane, end);
       T.colOwner[T.laneCol.get(lane)] = null; T.laneCol.delete(lane); T.last.delete(lane);
-      const ret = add({ type: 'return', lane: null, col: 0, steps: [st], agent: ag, retLane: lane });
+      const ret = add({ type: 'return', lane: null, col: 0, steps: [st], agent: ag, retLane: lane }, end.row + 1);
       edge(end, ret, 'return', lane);
       chain(null, ret);
       continue;
     }
     const col = lane ? colFor(lane) : 0;
     if (st.kind === 'tool') T.steps++;
+    const isFork = st.tool === 'Agent' || st.tool === 'Task';
     const groupable = st.kind === 'tool' && st.category === 'read' && !st.link;
     const prev = T.last.get(lane);
+    // Agents handed out back to back are drawn as one "hand out N jobs" node, so their lanes start on the same row.
+    if (isFork && prev && prev.forkGroup) { prev.steps.push(st); forkOf.set(st.toolUseId, prev); continue; }
     if (groupable && prev && prev.group) { prev.steps.push(st); continue; }
     let type = 'step';
     if (st.mark === 'turn-end') type = 'end';
     else if (st.mark === 'stopped') type = 'end-bad';
     else if (st.kind === 'system' || st.kind === 'agent') type = 'note';
-    const n = add({ type, lane, col, steps: [st], group: groupable, agent: lane ? agents.get(lane) : null });
-    if (st.tool === 'Agent' || st.tool === 'Task') forkOf.set(st.toolUseId, n);
+    const n = add({ type, lane, col, steps: [st], group: groupable, forkGroup: isFork, agent: lane ? agents.get(lane) : null },
+      type === 'end' || type === 'end-bad' ? T.maxRow + 1 : 0);
+    if (isFork) forkOf.set(st.toolUseId, n);
     chain(lane, n);
   }
   return turns;
@@ -400,6 +412,10 @@ function nodeView(n, s) {
     case 'end-bad': return { cls: 'pill end-bad', ic: 'stop', title: 'Đã dừng' };
     case 'note': return { cls: 'pill note', ic: st.mark === 'message' ? 'msg' : /Tác vụ chạy nền/.test(st.text) ? 'bell' : 'info', title: st.text };
     default: break;
+  }
+  if (n.forkGroup && n.steps.length > 1) {
+    const names = n.steps.map(x => (/”:\s*(.*)$/.exec(x.text) || [])[1] || x.link?.name).filter(Boolean);
+    return { cls: '', ic: 'bot', cat: 'agent', lane: lc, title: `Giao ${n.steps.length} việc song song`, sub: esc(names.join(' · ')), rawSub: true };
   }
   if (n.steps.length > 1) {
     const r = n.steps.filter(x => x.tool === 'Read').length;
@@ -487,6 +503,8 @@ function drawEdges(s, turns) {
     const byId = new Map(T.nodes.map(n => [n.id, n]));
     const R = 10;
     let out = '';
+    const forkIdx = new Map(), forkCount = new Map();
+    for (const e of T.edges) if (e.kind === 'fork') forkCount.set(e.from, (forkCount.get(e.from) || 0) + 1);
     for (const e of T.edges) {
       const a = boxes.get(e.from), b = boxes.get(e.to);
       if (!a || !b) continue;
@@ -500,7 +518,9 @@ function drawEdges(s, turns) {
         out += `<path class="edge ${dash ? 'dash' : ''} ${live ? 'live' : ''}" d="M${x} ${a.b} V${b.t - 1}" stroke="${color}"/>`;
         arrow = `M${x - 3.5} ${b.t - 6} L${x} ${b.t - 1} L${x + 3.5} ${b.t - 6}`;
       } else if (e.kind === 'fork') {
-        const x1 = a.r, y1 = a.cy, x2 = b.l + SPINE, y2 = b.t - 1;
+        const k = forkCount.get(e.from) || 1, i = forkIdx.get(e.from) || 0;
+        forkIdx.set(e.from, i + 1);
+        const x1 = a.r, y1 = a.cy + (i - (k - 1) / 2) * 6, x2 = b.l + SPINE, y2 = b.t - 1;
         out += `<path class="edge ${live ? 'live' : ''}" d="M${x1} ${y1} H${x2 - R} Q${x2} ${y1} ${x2} ${y1 + R} V${y2}" stroke="${color}"/>`;
         arrow = `M${x2 - 3.5} ${y2 - 5} L${x2} ${y2} L${x2 + 3.5} ${y2 - 5}`;
       } else {
