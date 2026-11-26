@@ -5,9 +5,12 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { describeTool, short } = require('./lib/describe');
 const items = require('./lib/items');
 const claudeSettings = require('./lib/claude-settings');
+const autostart = require('./lib/autostart');
+const { execFile } = require('child_process');
 
 const PORT = Number(process.env.AGENT_DASHBOARD_PORT || 4319);
 const HOST = '127.0.0.1';
@@ -115,6 +118,7 @@ function addStep(s, step) {
   pushStep(s, step);
   return step;
 }
+const ASK_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode']); // Claude stops and waits for your answer
 const findStep = (s, toolUseId) => toolUseId && [...s.steps].reverse().find(x => x.toolUseId === toolUseId);
 
 function laneOf(s, p) {
@@ -202,7 +206,7 @@ function processEvent(p) {
         if (input.status === 'deleted') delete s.tasks[input.taskId];
       }
       addStep(s, step);
-      s.status = 'working';
+      s.status = !lane && ASK_TOOLS.has(p.tool_name) ? 'waiting' : 'working';
       if (p.tool_name === 'Agent' || p.tool_name === 'Task') {
         s.agents.push({
           key: newId(), id: null, type: input.subagent_type || 'general-purpose', description: input.description || '',
@@ -223,6 +227,7 @@ function processEvent(p) {
         step.endedAt = p._ts;
         pushStep(s, step);
       }
+      if (ASK_TOOLS.has(p.tool_name) && s.status === 'waiting') s.status = 'working';
       const ag = s.agents.find(a => a.toolUseId && a.toolUseId === p.tool_use_id);
       if (ag) {
         const f = agentFacts(p);
@@ -314,7 +319,10 @@ function stateSnapshot() {
   const list = [...sessions.values()].filter(s => !config.hidden.includes(s.id))
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .map(s => ({ ...meta(s), steps: s.steps.slice(-800) }));
-  return { sessions: list, config, hooks: claudeSettings.status(), mainModel: claudeSettings.getModel() };
+  return {
+    sessions: list, config, hooks: claudeSettings.status(), mainModel: claudeSettings.getModel(),
+    autostart: autostart.status(), projects: projectDirs().filter(d => path.resolve(d) !== os.homedir()),
+  };
 }
 
 function readBody(req, limit = 25 * 1024 * 1024) {
@@ -397,6 +405,16 @@ async function route(req, res) {
     return json(res, 200, { ok: true });
   }
 
+  if (req.method === 'POST' && pathname === '/api/items/new') {
+    const body = await readBody(req);
+    const model = String(body.model || '');
+    if (!MODEL_VALUES.includes(model) || (model === 'inherit' && body.kind !== 'agent')) return json(res, 400, { error: 'Model không hợp lệ.' });
+    const project = body.project ? String(body.project) : '';
+    if (project && !projectDirs().includes(project)) return json(res, 400, { error: 'Không tìm thấy dự án này.' });
+    const id = items.create({ kind: body.kind, name: body.name, description: body.description, model, body: body.body }, project || null);
+    items.scan(projectDirs());
+    return json(res, 200, { id });
+  }
   if (req.method === 'GET' && pathname === '/api/items') return json(res, 200, { items: items.scan(projectDirs()) });
   if ((r = m(/^\/api\/items\/([0-9a-f]{12})(?:\/(history|restore|copy|version|model))?$/))) {
     const [, id, sub] = r;
@@ -440,6 +458,37 @@ async function route(req, res) {
     }
     return json(res, 200, { config });
   }
+  if (req.method === 'POST' && pathname === '/api/pick-folder') { // the macOS "choose folder" window, so nobody has to type a path
+    if (process.platform !== 'darwin') return json(res, 501, { error: 'Chỉ có trên macOS. Hãy dán đường dẫn thư mục vào ô bên dưới.' });
+    const script = ['activate', 'POSIX path of (choose folder with prompt "Chọn thư mục dự án có dùng Claude Code" default location (path to home folder))'];
+    return execFile('/usr/bin/osascript', script.flatMap(l => ['-e', l]), { timeout: 10 * 60e3 }, (err, stdout, stderr) => {
+      if (err) return /-128/.test(stderr || '') ? json(res, 200, { cancelled: true }) : json(res, 500, { error: 'Không mở được cửa sổ chọn thư mục.' });
+      const dir = stdout.trim().replace(/\/+$/, '') || '/';
+      return json(res, 200, { path: dir });
+    });
+  }
+  if (pathname === '/api/autostart') {
+    if (req.method === 'GET') return json(res, 200, autostart.status());
+    const body = await readBody(req);
+    if (!body.enabled) { const st = autostart.disable(); send({ type: 'autostart', autostart: st }); return json(res, 200, st); }
+    const st = autostart.enable();
+    const handOver = !autostart.underLaunchd();
+    json(res, 200, { ...st, handOver });
+    if (handOver) { // this Terminal copy steps aside so the background copy can take the port
+      setTimeout(() => {
+        server.close();
+        for (const c of clients) c.end();
+        autostart.handOver();
+        process.exit(0);
+      }, 300);
+    }
+    return;
+  }
+  if (req.method === 'POST' && pathname === '/api/shutdown') {
+    json(res, 200, { ok: true });
+    setTimeout(() => process.exit(0), 300);
+    return;
+  }
   if (req.method === 'POST' && pathname === '/api/hooks/install') { const st = claudeSettings.install(); send({ type: 'hooks', hooks: st }); return json(res, 200, st); }
   if (req.method === 'POST' && pathname === '/api/hooks/uninstall') { const st = claudeSettings.uninstall(); send({ type: 'hooks', hooks: st }); return json(res, 200, st); }
   if (req.method === 'POST' && pathname === '/api/main-model') {
@@ -469,5 +518,6 @@ server.on('error', err => {
 });
 server.listen(PORT, HOST, () => {
   console.log(`✅ Bảng điều khiển Agent đang chạy: http://${HOST}:${PORT}`);
-  console.log('   Giữ cửa sổ này mở. Đóng cửa sổ = tắt bảng điều khiển (Claude Code vẫn chạy bình thường).');
+  if (autostart.underLaunchd()) console.log('   Đang chạy nền (tự mở khi bật máy).');
+  else console.log('   Giữ cửa sổ này mở. Đóng cửa sổ = tắt bảng điều khiển (Claude Code vẫn chạy bình thường).\n   Muốn khỏi phải mở cửa sổ này: tab Cài đặt > “Tự mở khi bật máy”.');
 });

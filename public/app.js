@@ -167,7 +167,7 @@ const PLAN_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList',
 const S = {
   tab: location.hash.slice(1) || 'live',
   sessions: new Map(),
-  config: {}, hooks: {}, mainModel: '',
+  config: {}, hooks: {}, mainModel: '', autostart: { supported: false }, projects: [],
   items: null,
   selected: null, // session id
   sel: null, // selected step in the timeline, e.g. "agent:<key>"
@@ -185,7 +185,9 @@ async function loadState() {
     const st = await api('/api/state');
     S.sessions = new Map(st.sessions.map(s => [s.id, s]));
     S.config = st.config; S.hooks = st.hooks; S.mainModel = st.mainModel;
+    S.autostart = st.autostart || { supported: false }; S.projects = st.projects || [];
     renderAll();
+    updateTitle();
     loadItems().then(() => scheduleLive()).catch(() => {});
   } catch (e) { toast('Không tải được dữ liệu: ' + e.message, 'error'); }
 }
@@ -198,7 +200,10 @@ function connect() {
     const m = JSON.parse(e.data);
     if (m.type === 'session') {
       const old = S.sessions.get(m.session.id);
-      S.sessions.set(m.session.id, { ...m.session, steps: old?.steps || [] });
+      const s = { ...m.session, steps: old?.steps || [] };
+      S.sessions.set(m.session.id, s);
+      if (old) alertOnChange(s, effStatus(old), effStatus(s));
+      updateTitle();
       scheduleLive();
     } else if (m.type === 'step') {
       let s = S.sessions.get(m.sessionId);
@@ -208,6 +213,7 @@ function connect() {
       scheduleLive();
     } else if (m.type === 'config') { S.config = m.config; if (S.tab === 'settings') renderSettings(); }
     else if (m.type === 'hooks') { S.hooks = m.hooks; renderConn(); if (S.tab === 'settings') renderSettings(); scheduleLive(); }
+    else if (m.type === 'autostart') { S.autostart = m.autostart; if (S.tab === 'settings') renderSettings(); }
     else if (m.type === 'hidden') { S.sessions.delete(m.sessionId); scheduleLive(); }
   };
 }
@@ -245,6 +251,68 @@ function renderConn() {
   if (!S.live) { b.className = 'conn warn'; b.innerHTML = '<span class="dot"></span>Mất kết nối với bảng điều khiển'; return; }
   if (S.hooks.connected) { b.className = 'conn ok'; b.innerHTML = '<span class="dot"></span>Đã kết nối Claude Code'; }
   else { b.className = 'conn warn'; b.innerHTML = '<span class="dot"></span>Chưa kết nối Claude Code'; }
+  const ask = $('#notif-ask');
+  if (ask) ask.hidden = !('Notification' in window) || Notification.permission !== 'default' || !!localStorage.getItem('notifAskDismissed');
+}
+
+// ================================================================== alerts: tell you when Claude needs you or is done
+// You are usually in the Claude Code window, not here, so a browser notification (and a short chime) does the telling.
+const BASE_TITLE = document.title;
+const PREFS_DEFAULT = { wait: true, done: true, sound: true };
+const prefs = () => ({ ...PREFS_DEFAULT, ...JSON.parse(localStorage.getItem('alertPrefs') || '{}') });
+const setPref = (k, v) => localStorage.setItem('alertPrefs', JSON.stringify({ ...prefs(), [k]: v }));
+
+function updateTitle() {
+  const list = [...S.sessions.values()].map(effStatus);
+  const waiting = list.filter(st => st === 'waiting').length;
+  document.title = waiting ? `🔔 Đang chờ bạn${waiting > 1 ? ` (${waiting})` : ''} · ${BASE_TITLE}`
+    : list.includes('working') ? `⏳ Đang làm · ${BASE_TITLE}` : BASE_TITLE;
+}
+
+let audio = null;
+const wakeAudio = () => { try { audio = audio || new AudioContext(); if (audio.state === 'suspended') audio.resume(); } catch {} };
+document.addEventListener('pointerdown', wakeAudio, { once: true });
+document.addEventListener('keydown', wakeAudio, { once: true });
+function chime(kind) {
+  if (!audio || audio.state !== 'running') return;
+  const notes = kind === 'wait' ? [880, 660, 880] : [660, 880];
+  notes.forEach((f, i) => {
+    const o = audio.createOscillator(), g = audio.createGain(), t = audio.currentTime + i * 0.16;
+    o.frequency.value = f; o.type = 'sine';
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.18, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
+    o.connect(g).connect(audio.destination); o.start(t); o.stop(t + 0.32);
+  });
+}
+
+async function askNotifyPermission() {
+  if (!('Notification' in window)) return 'unsupported';
+  if (Notification.permission !== 'default') return Notification.permission;
+  try { return await Notification.requestPermission(); } catch { return Notification.permission; }
+}
+
+const lastAlert = new Map();
+function showAlert(kind, s, title, body) {
+  const p = prefs();
+  const key = `${s.id}|${kind}`;
+  if (Date.now() - (lastAlert.get(key) || 0) < 5000) return;
+  lastAlert.set(key, Date.now());
+  if (document.hasFocus()) { if (kind === 'wait') toast(`${title}: ${body}`); return; } // you're already looking at the page
+  if (p.sound) chime(kind);
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const n = new Notification(title, { body, tag: key, requireInteraction: kind === 'wait' });
+  n.onclick = () => { window.focus(); S.selected = s.id; setTab('live'); n.close(); };
+}
+
+function alertOnChange(s, before, after) {
+  if (before === after) return;
+  const p = prefs();
+  const what = [s.project, s.title].filter(Boolean).join(' · ') || 'Phiên Claude Code';
+  if (after === 'waiting' && p.wait) {
+    const ask = [...(s.steps || [])].reverse().find(x => x.mark === 'waiting' || (x.tool && ['AskUserQuestion', 'ExitPlanMode'].includes(x.tool) && x.status === 'running'));
+    showAlert('wait', s, '🔔 Claude đang chờ bạn', `${ask && ask.text ? ask.text + ' · ' : ''}${what}`);
+  } else if (after === 'done' && ACTIVE.has(before) && p.done) {
+    showAlert('done', s, '✅ Claude đã làm xong', what);
+  }
 }
 
 // ================================================================== agents & skills on disk
@@ -815,7 +883,7 @@ function nodeCtx(s, L, n, model) {
         (info.skills.length ? blk('Skill đã dùng', `<div class="flinks">${info.skills.map(x => `<span class="chip skill-chip">${icon('zap', 'sm')}${esc(x)}</span>`).join('')}</div>`) : '') +
         (info.agents.length ? blk('Agent con được gọi', `<div class="flinks">${info.agents.map(a => `<span class="chip">${icon('bot', 'sm')}${esc(a.type)}</span>`).join('')}</div>`) : '') +
         (info.files.length ? blk('File tạo/sửa', files(info.files)) : '');
-      c.middle = `<div class="small muted">${BUILTIN_AGENTS.includes(type) ? `“${esc(type)}” là agent có sẵn của Claude Code nên không có thiết lập riêng để chỉnh. Muốn chỉnh model hay hướng dẫn, hãy tạo một agent riêng.` : `Không tìm thấy file thiết lập của agent “${esc(type)}”.`}</div>`;
+      c.middle = `<div class="small muted">${BUILTIN_AGENTS.includes(type) ? `“${esc(type)}” là agent có sẵn của Claude Code nên không có thiết lập riêng để chỉnh. Muốn chỉnh model hay hướng dẫn, hãy tạo một agent riêng.<div style="margin-top:10px"><button class="btn sm primary" data-newitem="agent">${icon('plus', 'sm')}Tạo agent của riêng bạn</button></div>` : `Không tìm thấy file thiết lập của agent “${esc(type)}”.`}</div>`;
       return c;
     }
     case 'skill': {
@@ -1055,6 +1123,7 @@ async function renderTeam() {
         <div class="muted">Đổi model ngay trên thẻ (lưu luôn). Bấm vào thẻ để sửa hướng dẫn. Thay đổi áp dụng từ lần chạy tiếp theo.</div>
       </div>
       <button class="btn" data-tact="reload">${icon('refresh', 'sm')}Tải lại</button>
+      <button class="btn primary" data-newitem="${T.kind === 'skill' ? 'skill' : 'agent'}">${icon('plus', 'sm')}Tạo mới</button>
     </div>
     ${localStorage.getItem('hideExplain') ? '' : `<div class="callout" style="margin-bottom:16px">${icon('info', 'sm')}<div style="flex:1"><b>Agent</b> là một “nhân viên” chuyên một việc, được agent chính giao việc. <b>Skill</b> là một “quy trình mẫu” mà AI tự dùng khi gặp đúng loại việc.</div><button class="btn ghost sm" data-tact="hide-explain">Đã hiểu</button></div>`}
     <div class="toolbar">
@@ -1525,6 +1594,8 @@ function renderSettings() {
         ${h.error ? `<div class="callout bad" style="margin-bottom:12px">${esc(h.error)}</div>` : ''}
         <button class="btn primary lg" data-cact="install">${icon('plug', 'sm')}Kết nối với Claude Code</button>`}
     </div>
+    ${alertsCardHTML()}
+    ${autostartCardHTML()}
     <div class="card">
       <div class="h3">Model của agent chính</div>
       <div class="muted small" style="margin-bottom:12px">Model Claude Code dùng khi bạn mở phiên mới. Agent đặt “Giống agent chính” cũng dùng model này.</div>
@@ -1534,11 +1605,50 @@ function renderSettings() {
     </div>
     <div class="card">
       <div class="h3">Thư mục dự án</div>
-      <div class="muted small" style="margin-bottom:12px">Bảng điều khiển tự tìm agent và skill trong các dự án bạn đã mở Claude Code. Muốn thêm dự án khác thì dán đường dẫn thư mục vào đây.</div>
+      <div class="muted small" style="margin-bottom:12px">Bảng điều khiển tự tìm agent và skill trong các dự án bạn đã mở Claude Code. Muốn thêm dự án khác thì ${S.autostart.supported ? 'bấm “Chọn thư mục…”' : 'dán đường dẫn thư mục vào đây'}.</div>
       ${(c.extraProjects || []).map((p, i) => `<div class="list-line"><span style="flex:1">${esc(p)}</span><button class="btn ghost sm" data-rmproj="${i}">Xoá</button></div>`).join('')}
-      <div class="row"><input type="text" id="proj" class="input" style="flex:1" placeholder="/Users/ban/du-an-cua-toi"><button class="btn" data-cact="addproj">${icon('plus', 'sm')}Thêm</button></div>
+      ${S.autostart.supported ? `<button class="btn" data-cact="pickproj">${icon('folder', 'sm')}Chọn thư mục…</button>
+      <details class="alt"><summary>Hoặc dán đường dẫn thư mục</summary>${projInput()}</details>` : projInput()}
     </div>
   </div>`;
+}
+const projInput = () => `<div class="row"><input type="text" id="proj" class="input" style="flex:1" placeholder="/Users/ban/du-an-cua-toi"><button class="btn" data-cact="addproj">${icon('plus', 'sm')}Thêm</button></div>`;
+
+function alertsCardHTML() {
+  const p = prefs();
+  const perm = 'Notification' in window ? Notification.permission : 'unsupported';
+  const state = perm === 'granted'
+    ? `<div class="callout ok" style="margin:10px 0">${icon('check', 'sm')}<div>Thông báo đã bật. Khi bạn đang ở cửa sổ khác, máy sẽ hiện thông báo ở góc màn hình.</div></div>`
+    : perm === 'denied'
+      ? `<div class="callout warn" style="margin:10px 0">${icon('alert', 'sm')}<div>Trình duyệt đang chặn thông báo của trang này. Bấm biểu tượng ổ khoá (hoặc biểu tượng cài đặt) cạnh địa chỉ <b>127.0.0.1:4319</b> trên thanh địa chỉ, chọn <b>Thông báo: Cho phép</b>, rồi tải lại trang. Trong lúc đó vẫn có tiếng chuông và tiêu đề tab đổi thành 🔔.</div></div>`
+      : perm === 'unsupported' ? '<div class="small muted" style="margin:10px 0">Trình duyệt này không hỗ trợ thông báo. Vẫn có tiếng chuông và tiêu đề tab đổi thành 🔔.</div>'
+        : `<div style="margin:10px 0"><button class="btn primary" data-cact="notify-on">🔔 Bật thông báo</button></div>`;
+  const opt = (k, label) => `<label class="toggle"><input type="checkbox" data-pref="${k}" ${p[k] ? 'checked' : ''}><span>${label}</span></label>`;
+  return `<div class="card">
+      <div class="h3">Báo cho bạn</div>
+      <div class="muted small">Bạn thường ở cửa sổ Claude Code chứ không nhìn trang này, nên trang sẽ báo khi có việc cần bạn. Tiêu đề tab cũng đổi thành 🔔 khi Claude đang chờ.</div>
+      ${state}
+      <div class="opt-list">
+        ${opt('wait', 'Khi Claude <b>đang chờ bạn</b> trả lời hoặc cho phép')}
+        ${opt('done', 'Khi Claude <b>làm xong</b> việc bạn giao')}
+        ${opt('sound', 'Phát tiếng chuông')}
+      </div>
+      <button class="btn sm" data-cact="notify-test">Thử báo</button>
+    </div>`;
+}
+
+function autostartCardHTML() {
+  const a = S.autostart;
+  if (!a.supported) return '';
+  const body = a.enabled && a.background
+    ? `<div class="callout ok" style="margin:10px 0">${icon('check', 'sm')}<div><b>Đang chạy nền.</b> Bảng điều khiển tự mở mỗi khi bạn bật máy, không cần cửa sổ Terminal. Muốn xem thì bấm đúp <b>start.command</b> hoặc mở <b>127.0.0.1:4319</b>.</div></div>
+       <div class="row"><button class="btn" data-cact="autostart-off">Tắt tự mở khi bật máy</button><button class="btn danger" data-cact="shutdown">Tắt bảng điều khiển ngay</button></div>`
+    : a.enabled
+      ? `<div class="callout ok" style="margin:10px 0">${icon('check', 'sm')}<div>Đã bật. Từ lần bật máy sau, bảng điều khiển sẽ tự chạy nền.</div></div>
+         <button class="btn" data-cact="autostart-off">Tắt tự mở khi bật máy</button>`
+      : `<p class="muted small" style="margin:6px 0 14px">Hiện bạn phải bấm đúp <b>start.command</b> và giữ cửa sổ Terminal mở. Bật tuỳ chọn này thì bảng điều khiển chạy nền và tự mở khi bật máy, không còn cửa sổ Terminal nào cả. Tắt lại bất cứ lúc nào.</p>
+         <button class="btn primary" data-cact="autostart-on">Bật tự mở khi bật máy</button>`;
+  return `<div class="card"><div class="h3">Tự mở khi bật máy</div>${body}</div>`;
 }
 
 $('#view-settings').addEventListener('click', async e => {
@@ -1548,6 +1658,49 @@ $('#view-settings').addEventListener('click', async e => {
     if (rm) { const list = (S.config.extraProjects || []).filter((_, i) => i !== Number(rm.dataset.rmproj)); const { config } = await api('/api/config', { extraProjects: list }); S.config = config; S.items = null; return renderSettings(); }
     const act = t.closest('[data-cact]')?.dataset.cact;
     if (act === 'install' || act === 'uninstall') return hooksAction(act);
+    if (act === 'notify-on') { const r = await askNotifyPermission(); renderSettings(); renderConn(); if (r === 'granted') toast('Đã bật thông báo.'); return; }
+    if (act === 'notify-test') {
+      wakeAudio();
+      if (prefs().sound) setTimeout(() => chime('wait'), 50);
+      if ('Notification' in window && Notification.permission === 'granted') new Notification('🔔 Claude đang chờ bạn', { body: 'Đây là thông báo thử. Bạn sẽ thấy thế này khi Claude cần bạn.' });
+      else toast('Chưa bật thông báo của trình duyệt, nên chỉ có tiếng chuông.');
+      return;
+    }
+    if (act === 'pickproj') {
+      t.closest('button').disabled = true;
+      toast('Đang mở cửa sổ chọn thư mục…');
+      try {
+        const r = await api('/api/pick-folder', {});
+        if (r.cancelled || !r.path) return;
+        if ((S.config.extraProjects || []).includes(r.path)) return toast('Thư mục này đã có trong danh sách.');
+        const { config } = await api('/api/config', { extraProjects: [...(S.config.extraProjects || []), r.path] });
+        S.config = config; S.items = null; S.projects = [...new Set([...S.projects, r.path])];
+        toast(`Đã thêm dự án “${base(r.path)}”.`);
+      } finally { renderSettings(); }
+      return;
+    }
+    if (act === 'autostart-on') {
+      const r = await api('/api/autostart', { enabled: true });
+      S.autostart = r;
+      if (r.handOver) {
+        toast('Đã bật. Bảng điều khiển đang chuyển sang chạy nền, trang sẽ tự kết nối lại sau vài giây. Giờ bạn có thể đóng cửa sổ Terminal.');
+      } else toast('Đã bật tự mở khi bật máy.');
+      return renderSettings();
+    }
+    if (act === 'autostart-off') {
+      const ok = await modal({ title: 'Tắt tự mở khi bật máy?', text: 'Từ lần bật máy sau, bạn cần bấm đúp start.command để mở bảng điều khiển. Lần này nó vẫn chạy tới khi bạn tắt máy.', okText: 'Tắt tự mở' });
+      if (!ok) return;
+      S.autostart = await api('/api/autostart', { enabled: false });
+      toast('Đã tắt tự mở khi bật máy.');
+      return renderSettings();
+    }
+    if (act === 'shutdown') {
+      const ok = await modal({ title: 'Tắt bảng điều khiển?', text: 'Claude Code vẫn chạy bình thường. Muốn mở lại thì bấm đúp start.command. Lần bật máy sau nó cũng tự mở lại.', okText: 'Tắt', okClass: 'danger-solid' });
+      if (!ok) return;
+      await api('/api/shutdown', {});
+      toast('Đã tắt bảng điều khiển.');
+      return;
+    }
     if (act === 'addproj') {
       const v = $('#proj').value.trim();
       if (!v) return;
@@ -1558,6 +1711,7 @@ $('#view-settings').addEventListener('click', async e => {
   } catch (err) { toast(err.message, 'error'); }
 });
 $('#view-settings').addEventListener('change', async e => {
+  if (e.target.dataset.pref) { setPref(e.target.dataset.pref, e.target.checked); return; }
   try {
     if (e.target.id === 'main-model') { const { mainModel } = await api('/api/main-model', { model: e.target.value }); S.mainModel = mainModel; toast('Đã đổi model cho các phiên mới.'); }
   } catch (err) { toast(err.message, 'error'); }
@@ -1568,6 +1722,7 @@ async function hooksAction(act) {
     const ok = await modal({ title: 'Ngắt kết nối với Claude Code?', text: 'Bảng điều khiển sẽ không còn thấy các bước mới. Có thể kết nối lại bất cứ lúc nào.', okText: 'Ngắt kết nối', okClass: 'danger-solid' });
     if (!ok) return;
   }
+  if (act === 'install') askNotifyPermission().then(() => { renderConn(); if (S.tab === 'settings') renderSettings(); });
   try {
     S.hooks = await api(`/api/hooks/${act}`, {});
     toast(act === 'install' ? 'Đã kết nối. Mở một cửa sổ Claude Code mới và giao việc để xem các bước.' : 'Đã ngắt kết nối.');
@@ -1575,13 +1730,124 @@ async function hooksAction(act) {
   } catch (err) { toast(err.message, 'error'); }
 }
 
+// ================================================================== create a new agent / skill (no file to write by hand)
+const TEMPLATES = [
+  { k: 'blank', n: 'Trống', name: '', desc: '', body: '## Nhiệm vụ\nMô tả việc cần làm ở đây.\n\n## Quy tắc\n- Luôn trả lời bằng tiếng Việt\n' },
+  { k: 'translate', n: 'Dịch thuật', name: 'Dịch thuật', desc: 'Dùng khi cần dịch văn bản, tài liệu hoặc tin nhắn giữa tiếng Việt và tiếng Anh, giữ đúng giọng văn và thuật ngữ.',
+    body: '## Nhiệm vụ\nDịch nội dung được giao sang ngôn ngữ đích, tự nhiên như người bản xứ viết.\n\n## Quy tắc\n- Giữ nguyên tên riêng, tên sản phẩm và thuật ngữ chuyên ngành\n- Giữ nguyên định dạng: tiêu đề, gạch đầu dòng, bảng\n- Nếu một câu có thể hiểu theo nhiều nghĩa, ghi chú ngắn ở cuối bản dịch\n- Không thêm hoặc bớt ý so với bản gốc\n' },
+  { k: 'email', n: 'Viết email', name: 'Viết email', desc: 'Dùng khi cần soạn hoặc sửa email công việc: gửi khách hàng, đối tác, sếp hoặc đồng nghiệp.',
+    body: '## Nhiệm vụ\nSoạn email rõ ràng, lịch sự, đúng mục đích người dùng đưa ra.\n\n## Quy tắc\n- Dòng tiêu đề ngắn, nói rõ việc chính\n- Câu đầu tiên nói ngay mục đích email\n- Mỗi đoạn tối đa 3 câu\n- Kết thúc bằng việc cần người nhận làm và hạn chót (nếu có)\n- Đưa ra 2 phiên bản: trang trọng và thân thiện\n' },
+  { k: 'summary', n: 'Tóm tắt tài liệu', name: 'Tóm tắt tài liệu', desc: 'Dùng khi cần tóm tắt tài liệu dài, báo cáo, biên bản họp hoặc bài viết thành vài ý chính.',
+    body: '## Nhiệm vụ\nĐọc tài liệu được giao và tóm tắt thành các ý chính dễ đọc.\n\n## Quy tắc\n- Mở đầu bằng 1 câu nói tài liệu này về việc gì\n- Tối đa 5 ý chính, mỗi ý một dòng\n- Liệt kê riêng các con số, mốc thời gian và việc cần làm\n- Không suy diễn những gì tài liệu không nói\n' },
+  { k: 'proofread', n: 'Soát lỗi văn bản', name: 'Soát lỗi văn bản', desc: 'Dùng khi cần kiểm tra chính tả, ngữ pháp và cách diễn đạt của một văn bản trước khi gửi đi.',
+    body: '## Nhiệm vụ\nTìm và sửa lỗi chính tả, ngữ pháp, dấu câu và câu khó hiểu.\n\n## Quy tắc\n- Chỉ sửa chỗ sai, không viết lại cả bài\n- Liệt kê từng chỗ đã sửa: bản cũ → bản mới, kèm lý do ngắn\n- Giữ nguyên giọng văn của người viết\n' },
+  { k: 'report', n: 'Báo cáo tuần', name: 'Báo cáo tuần', desc: 'Dùng khi cần viết báo cáo công việc hằng tuần từ ghi chú, danh sách việc hoặc tin nhắn.',
+    body: '## Nhiệm vụ\nGom thông tin người dùng đưa ra thành báo cáo tuần gọn gàng.\n\n## Cấu trúc báo cáo\n- Đã xong tuần này\n- Đang làm và tiến độ\n- Vướng mắc, cần hỗ trợ\n- Kế hoạch tuần tới\n\n## Quy tắc\n- Mỗi mục tối đa 5 dòng\n- Ghi rõ con số khi có\n' },
+];
+// Must match slugify() in lib/items.js: this is the name Claude Code uses to call it.
+const slugify = n => String(n || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[đĐ]/g, 'd')
+  .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64).replace(/-+$/, '');
+
+function newItemDialog(kind = 'agent') {
+  const F = { kind, tpl: 'blank', name: '', description: '', project: '' };
+  const m = $('#modal');
+  const kindHelp = k => (k === 'agent'
+    ? '<b>Agent</b> là một “nhân viên” chuyên một việc. Agent chính sẽ giao việc cho nó khi gặp đúng loại việc.'
+    : '<b>Skill</b> là một “quy trình mẫu”. AI tự làm theo quy trình này khi gặp đúng loại việc.');
+  const draw = () => {
+    const slug = slugify(F.name);
+    m.innerHTML = `<div class="modal-box wide" role="dialog">
+      <h3>Tạo mới</h3>
+      <div class="field" style="margin-top:12px">
+        <div class="seg" data-nf-kind>${[['agent', 'Agent'], ['skill', 'Skill']].map(([v, l]) => `<button type="button" data-v="${v}" class="${F.kind === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+        <div class="help" style="margin-top:8px">${kindHelp(F.kind)}</div>
+      </div>
+      <div class="field">
+        <div class="flabel">Bắt đầu từ mẫu</div>
+        <div class="help">Chọn mẫu gần nhất với việc bạn cần, sau đó sửa lại cho hợp.</div>
+        <div class="tpls">${TEMPLATES.map(t => `<button type="button" class="tpl ${F.tpl === t.k ? 'on' : ''}" data-tpl="${t.k}">${esc(t.n)}</button>`).join('')}</div>
+      </div>
+      <div class="field">
+        <label for="nf-name">Tên</label>
+        <input type="text" id="nf-name" class="input" placeholder="Ví dụ: Dịch hợp đồng" value="${esc(F.name)}">
+        <div class="slug" id="nf-slug">${slug ? `Tên Claude Code dùng để gọi: <code>${esc(slug)}</code>` : 'Viết bằng tiếng Việt có dấu cũng được.'}</div>
+      </div>
+      <div class="field">
+        <label for="nf-desc">Khi nào dùng?</label>
+        <div class="help">AI đọc câu này để quyết định lúc nào ${F.kind === 'agent' ? 'giao việc cho agent' : 'dùng skill'}. Viết rõ loại việc, ví dụ: “Dùng khi cần dịch hợp đồng tiếng Anh”.</div>
+        <textarea id="nf-desc" rows="3">${esc(F.description)}</textarea>
+      </div>
+      <div class="field">
+        <label for="nf-where">Dùng ở đâu?</label>
+        <select id="nf-where" class="select" style="width:100%">
+          <option value="">Mọi dự án (chỉ trên máy của bạn)</option>
+          ${S.projects.map(d => `<option value="${esc(d)}" ${F.project === d ? 'selected' : ''}>Chỉ dự án “${esc(base(d))}”</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-err" id="nf-err" hidden></div>
+      <div class="modal-actions">
+        <button class="btn" data-a="cancel">Huỷ</button>
+        <button class="btn primary" data-a="ok">${icon('plus', 'sm')}Tạo và mở để chỉnh</button>
+      </div></div>`;
+  };
+  const read = () => { F.name = $('#nf-name').value; F.description = $('#nf-desc').value; F.project = $('#nf-where').value; };
+  const close = () => { m.hidden = true; m.innerHTML = ''; m.onclick = m.oninput = null; document.removeEventListener('keydown', onKey, true); };
+  const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+  draw();
+  m.hidden = false;
+  document.addEventListener('keydown', onKey, true);
+  setTimeout(() => $('#nf-name')?.focus(), 0);
+  m.oninput = e => {
+    if (e.target.id !== 'nf-name') return;
+    const slug = slugify(e.target.value);
+    $('#nf-slug').innerHTML = slug ? `Tên Claude Code dùng để gọi: <code>${esc(slug)}</code>` : 'Viết bằng tiếng Việt có dấu cũng được.';
+  };
+  m.onclick = async e => {
+    const t = e.target;
+    if (t === m || t.closest('[data-a="cancel"]')) return close();
+    const k = t.closest('[data-nf-kind] button');
+    if (k) { read(); F.kind = k.dataset.v; return draw(); }
+    const tp = t.closest('[data-tpl]');
+    if (tp) {
+      read();
+      const old = TEMPLATES.find(x => x.k === F.tpl), nt = TEMPLATES.find(x => x.k === tp.dataset.tpl);
+      if (!F.name.trim() || F.name === old.name) F.name = nt.name; // only fill what you haven't typed yourself
+      if (!F.description.trim() || F.description === old.desc) F.description = nt.desc;
+      F.tpl = nt.k;
+      return draw();
+    }
+    if (!t.closest('[data-a="ok"]')) return;
+    read();
+    const err = $('#nf-err'), btn = t.closest('button');
+    btn.disabled = true;
+    try {
+      const tpl = TEMPLATES.find(x => x.k === F.tpl);
+      const { id } = await api('/api/items/new', { kind: F.kind, name: F.name, description: F.description, project: F.project, body: tpl.body });
+      close();
+      await loadItems(true);
+      if (S.tab === 'team') renderTeam();
+      toast(`Đã tạo ${F.kind === 'agent' ? 'agent' : 'skill'}. Sửa hướng dẫn cho hợp rồi bấm “Lưu”. Mở phiên Claude Code mới để dùng.`);
+      openEditor(id);
+    } catch (ex) { err.hidden = false; err.textContent = ex.message; btn.disabled = false; }
+  };
+}
+document.addEventListener('click', e => { const b = e.target.closest('[data-newitem]'); if (b) { e.preventDefault(); newItemDialog(b.dataset.newitem); } });
+
 // ================================================================== wiring
 $$('.tab').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
 $('#conn').addEventListener('click', () => setTab('settings'));
+$('#notif-ask').addEventListener('click', async () => {
+  const r = await askNotifyPermission();
+  if (r === 'denied') localStorage.setItem('notifAskDismissed', '1');
+  renderConn();
+  if (S.tab === 'settings') renderSettings();
+  if (r === 'granted') toast('Đã bật thông báo. Bạn sẽ được báo khi Claude chờ bạn hoặc làm xong.');
+});
 document.addEventListener('click', e => { if (e.target.closest('[data-global="install"]')) hooksAction('install'); });
 // Keep durations ticking while something runs; otherwise refresh the "x minutes ago" labels now and then.
 setInterval(() => { if (S.tab === 'live' && [...S.sessions.values()].some(s => effStatus(s) === 'working')) scheduleLive(); }, 5000);
 setInterval(() => { if (S.tab === 'live') scheduleLive(); }, 60000);
+setInterval(updateTitle, 30000); // a session that went quiet turns stale
 
 renderAll();
 connect();
