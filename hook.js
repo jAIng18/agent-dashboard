@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-// Claude Code hook: forwards each event to the local dashboard and prints the dashboard's answer.
+// Claude Code hook: forwards each event to the local dashboard (which only watches, it never blocks Claude Code).
 // If the dashboard isn't running, it exits silently so Claude Code works exactly as usual.
 const http = require('http');
 
@@ -9,13 +9,11 @@ let input = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', d => { input += d; });
 process.stdin.on('end', () => {
-  let event;
-  try { event = JSON.parse(input).hook_event_name; } catch { process.exit(0); }
-  const waits = event === 'PreToolUse';
+  try { JSON.parse(input); } catch { process.exit(0); }
   const req = http.request({
     host: '127.0.0.1', port: PORT, path: '/api/hook', method: 'POST',
     headers: { 'content-type': 'application/json', 'x-agent-dashboard': 'hook', 'content-length': Buffer.byteLength(input) },
-    timeout: waits ? 615000 : 2500,
+    timeout: 2500,
   }, res => {
     let out = '';
     res.setEncoding('utf8');

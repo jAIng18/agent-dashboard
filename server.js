@@ -1,10 +1,11 @@
 'use strict';
-// Agent Dashboard: live view of Claude Code agents, approvals, and a friendly editor for agents & skills.
-// Zero dependencies. Listens on 127.0.0.1 only.
+// Agent Dashboard: shows, step by step, what each loop of Claude Code is doing and which agents / skills it uses,
+// and lets you change an agent's or skill's model and instructions without opening any Markdown file.
+// It only watches: it never blocks or changes what Claude Code does. Zero dependencies. Listens on 127.0.0.1 only.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { describeTool, short, RISKY, NEVER_ASK } = require('./lib/describe');
+const { describeTool, short } = require('./lib/describe');
 const items = require('./lib/items');
 const claudeSettings = require('./lib/claude-settings');
 
@@ -15,18 +16,17 @@ const PUBLIC = path.join(__dirname, 'public');
 const CONFIG_FILE = path.join(DATA, 'config.json');
 const EVENTS_FILE = path.join(DATA, 'events.jsonl');
 const MAX_SESSIONS = 60;
-const MAX_STEPS = 1500;
+const MAX_STEPS = 3000;
 
 fs.mkdirSync(DATA, { recursive: true });
 items.init(DATA);
 
 const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return d; } };
-let config = { approvalMode: 'watch', approvalTimeoutSec: 600, extraProjects: [], hidden: [], ...readJson(CONFIG_FILE, {}) };
+let config = { extraProjects: [], hidden: [], ...readJson(CONFIG_FILE, {}) };
 const saveConfig = () => fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 
 // ---------------------------------------------------------------- live state
 const sessions = new Map();
-const approvals = new Map(); // id -> { meta, finish }
 const clients = new Set();
 let seq = 0;
 const newId = () => Date.now().toString(36) + (seq++).toString(36);
@@ -48,15 +48,32 @@ function summarizeResponse(r) {
   return JSON.stringify(r);
 }
 
+// Agent results carry the model that really ran and the agent's id; keep them even after the text is cut.
+function agentFacts(p) {
+  const r = p.tool_response;
+  const fromObj = r && typeof r === 'object' ? r : {};
+  const str = typeof r === 'string' ? r : '';
+  return {
+    model: p._resolvedModel || fromObj.resolvedModel || (/"resolvedModel":"([^"]+)"/.exec(str) || [])[1] || '',
+    agentId: p._agentId || fromObj.agentId || (/"agentId":"([^"]+)"/.exec(str) || [])[1] || '',
+    background: fromObj.isAsync === true || /async_launched|"isAsync":true/.test(str),
+  };
+}
+
 // Keeps the event log small: long text fields are cut before being written to disk.
 function slim(p) {
   const out = { ...p };
-  if ('tool_response' in out) out.tool_response = trunc(summarizeResponse(out.tool_response), 1500);
+  if (out.tool_name === 'Agent' || out.tool_name === 'Task') {
+    const f = agentFacts(p);
+    if (f.model) out._resolvedModel = f.model;
+    if (f.agentId) out._agentId = f.agentId;
+  }
+  if ('tool_response' in out) out.tool_response = trunc(summarizeResponse(out.tool_response), 3000);
   if (out.tool_input && typeof out.tool_input === 'object') {
     out.tool_input = Object.fromEntries(Object.entries(out.tool_input).map(([k, v]) =>
       [k, typeof v === 'string' ? trunc(v, 4000) : v]));
   }
-  if (typeof out.prompt === 'string') out.prompt = trunc(out.prompt, 4000);
+  if (typeof out.prompt === 'string') out.prompt = trunc(out.prompt, 6000);
   delete out.transcript_path; delete out.agent_transcript_path;
   return out;
 }
@@ -68,7 +85,6 @@ function getSession(p) {
     s = {
       id, cwd: p.cwd || '', project: p.cwd ? path.basename(p.cwd) : 'Không rõ thư mục', title: '',
       status: 'idle', startedAt: p._ts, updatedAt: p._ts, steps: [], agents: [], todos: [], tasks: {},
-      stopRequested: false, messages: [], allowTools: [],
     };
     sessions.set(id, s);
     if (sessions.size > MAX_SESSIONS) {
@@ -77,11 +93,12 @@ function getSession(p) {
     }
   }
   if (p.cwd && !s.cwd) { s.cwd = p.cwd; s.project = path.basename(p.cwd); }
+  if (typeof p.model === 'string' && p.model && !p.agent_id) s.model = p.model; // SessionStart reports the main model
   s.updatedAt = p._ts;
   return s;
 }
 
-const meta = s => ({ ...s, steps: undefined, messages: s.messages.length, stepCount: s.steps.length });
+const meta = s => ({ ...s, steps: undefined, stepCount: s.steps.length });
 
 function send(obj) {
   const line = `data: ${JSON.stringify(obj)}\n\n`;
@@ -89,7 +106,6 @@ function send(obj) {
 }
 const pushSession = s => { if (!replaying) send({ type: 'session', session: meta(s) }); };
 const pushStep = (s, step) => { if (!replaying) send({ type: 'step', sessionId: s.id, step }); };
-const pushApprovals = () => send({ type: 'approvals', approvals: [...approvals.values()].map(a => a.meta) });
 
 function addStep(s, step) {
   step.id = step.id || newId();
@@ -104,6 +120,7 @@ const findStep = (s, toolUseId) => toolUseId && [...s.steps].reverse().find(x =>
 function laneOf(s, p) {
   if (!p.agent_id) return null;
   let ag = s.agents.find(a => a.id === p.agent_id);
+  if (ag && ag.status === 'done' && p.hook_event_name !== 'SubagentStop') ag.status = 'working'; // still sending events, so not done
   if (!ag) {
     ag = s.agents.find(a => !a.id && a.status === 'starting' && (!p.agent_type || a.type === p.agent_type));
     if (ag) { ag.id = p.agent_id; ag.status = 'working'; }
@@ -112,9 +129,17 @@ function laneOf(s, p) {
   return ag.key;
 }
 
-function laneName(s, key) {
-  const a = key && s.agents.find(x => x.key === key);
-  return a ? a.type : 'Agent chính';
+// What changed in the plan (TodoWrite): which jobs started or finished. These become steps people can read.
+function planChanges(oldList, newList) {
+  if (!oldList.length && newList.length) return [{ kind: 'plan', items: newList.map(t => t.content) }];
+  const out = [];
+  for (const t of newList) {
+    const was = oldList.find(o => o.content === t.content);
+    if ((!was || was.status !== t.status) && (t.status === 'in_progress' || t.status === 'completed')) {
+      out.push({ kind: t.status === 'in_progress' ? 'start' : 'done', content: t.status === 'in_progress' && t.activeForm ? t.activeForm : t.content });
+    }
+  }
+  return out;
 }
 
 function processEvent(p) {
@@ -123,42 +148,67 @@ function processEvent(p) {
   const input = p.tool_input || {};
   switch (ev) {
     case 'SessionStart': {
-      const label = { startup: 'Bắt đầu phiên làm việc', resume: 'Tiếp tục phiên cũ', clear: 'Bắt đầu lại từ đầu', compact: 'Thu gọn trí nhớ hội thoại' }[p.source];
-      addStep(s, { kind: 'system', mark: p.source === 'compact' ? 'note' : 'session-start', icon: p.source === 'compact' ? '🗜️' : '🚀', text: label || 'Bắt đầu phiên làm việc', ts: p._ts });
       if (p.source !== 'compact') s.status = 'idle';
       break;
     }
-    case 'UserPromptSubmit':
-      if (/^\s*<[a-z][\w-]*[\s>]/i.test(p.prompt || '')) { // system wrappers (task results, agent hand-backs…), not something you typed
-        const done = /<status>(\w+)<\/status>/.exec(p.prompt || '');
-        const summary = /<summary>([\s\S]*?)<\/summary>/.exec(p.prompt || '');
-        const isAgentMsg = /^\s*<agent-message/i.test(p.prompt || '');
-        const text = isAgentMsg ? 'Agent phụ gửi kết quả về'
-          : `Tác vụ chạy nền ${done && done[1] === 'completed' ? 'đã xong' : done && done[1] === 'failed' ? 'bị lỗi' : 'báo tin'}${summary ? ': ' + short(summary[1], 100) : ''}`;
-        addStep(s, { kind: 'system', mark: 'note', icon: '🔔', text, detail: trunc(p.prompt, 4000), ts: p._ts });
+    case 'UserPromptSubmit': {
+      const prompt = p.prompt || '';
+      const cmd = /<command-name>\s*\/?([^<\s]+)\s*<\/command-name>/.exec(prompt);
+      if (cmd) { // you typed a slash command, e.g. /write-prd
+        const args = (/<command-args>([\s\S]*?)<\/command-args>/.exec(prompt) || [])[1] || '';
+        const text = `/${cmd[1]}${args.trim() ? ' ' + args.trim() : ''}`;
+        if (!s.title) s.title = short(text, 90);
+        s.status = 'working';
+        addStep(s, { kind: 'prompt', promptText: short(text, 600), text, command: cmd[1], ts: p._ts });
+        break;
+      }
+      if (/^\s*<[a-z][\w-]*[\s>]/i.test(prompt)) { // system wrappers (background results, agent hand-backs…), not something you typed
+        const status = (/<status>(\w+)<\/status>/.exec(prompt) || [])[1];
+        const summary = (/<summary>([\s\S]*?)<\/summary>/.exec(prompt) || [])[1];
+        const result = (/<result>([\s\S]*?)<\/result>/.exec(prompt) || [])[1];
+        const toolUse = (/<tool-use-id>([^<]+)<\/tool-use-id>/.exec(prompt) || [])[1];
+        const from = (/^\s*<agent-message from="([^"]+)"/.exec(prompt) || [])[1];
+        const ag = (toolUse && s.agents.find(a => a.toolUseId === toolUse)) || (from && s.agents.find(a => a.id === from));
+        if (ag) { // a background agent reporting back
+          const report = from && (/The report follows:\n([\s\S]*?)(?:<\/agent-message>\s*)?$/.exec(prompt) || [])[1];
+          ag.status = status === 'failed' ? 'failed' : 'done';
+          ag.endedAt = ag.endedAt || p._ts;
+          const text = report ? report.replace(/^ {2}/gm, '').trim() : result || summary;
+          if (text) ag.result = trunc(text, 3000);
+          addStep(s, { kind: 'system', mark: 'agent-report', agentKey: ag.key, text: `Agent “${ag.description || ag.type}” gửi kết quả về`, ts: p._ts });
+        }
         s.status = 'working';
         break;
       }
-      if (!s.title) s.title = short(p.prompt, 90);
-      s.stopRequested = false;
+      if (!s.title) s.title = short(prompt, 90);
       s.status = 'working';
-      addStep(s, { kind: 'prompt', icon: '💬', promptText: short(p.prompt, 400), text: `Bạn yêu cầu: ${short(p.prompt, 160)}`, detail: trunc(p.prompt, 4000), ts: p._ts });
+      addStep(s, { kind: 'prompt', promptText: short(prompt, 600), text: short(prompt, 160), detail: trunc(prompt, 4000), ts: p._ts });
       break;
+    }
     case 'PreToolUse': {
       const lane = laneOf(s, p);
       const d = describeTool(p.tool_name, input);
-      addStep(s, { kind: 'tool', tool: p.tool_name, lane, status: 'running', toolUseId: p.tool_use_id, ...d, detail: trunc(d.detail, 4000), ts: p._ts });
-      if (!['stopped', 'approval'].includes(s.status)) s.status = 'working';
-      if (p.tool_name === 'Agent' || p.tool_name === 'Task') {
-        s.agents.push({ key: newId(), id: null, type: input.subagent_type || 'general-purpose', description: input.description || '', model: input.model || '', status: 'starting', toolUseId: p.tool_use_id, startedAt: p._ts });
-      }
+      const step = { kind: 'tool', tool: p.tool_name, lane, status: 'running', toolUseId: p.tool_use_id, ...d, detail: trunc(d.detail, 4000), ts: p._ts };
       if (p.tool_name === 'TodoWrite' && Array.isArray(input.todos)) {
-        s.todos = input.todos.map(t => ({ content: t.content || t.activeForm || '', activeForm: t.activeForm, status: t.status }));
+        const next = input.todos.map(t => ({ content: t.content || t.activeForm || '', activeForm: t.activeForm, status: t.status }));
+        if (!lane) { step.plan = planChanges(s.todos, next); s.todos = next; }
       }
-      if (p.tool_name === 'TaskUpdate' && input.taskId && s.tasks[input.taskId]) {
-        if (input.status) s.tasks[input.taskId].status = input.status;
-        if (input.subject) s.tasks[input.taskId].content = input.subject;
+      if (p.tool_name === 'TaskCreate' && !lane) step.plan = [{ kind: 'add', content: input.subject || '' }];
+      if (p.tool_name === 'TaskUpdate' && input.taskId && s.tasks[input.taskId] && !lane) {
+        const t = s.tasks[input.taskId];
+        if (input.subject) t.content = input.subject;
+        if (input.status === 'in_progress' || input.status === 'completed') step.plan = [{ kind: input.status === 'in_progress' ? 'start' : 'done', content: t.content }];
+        if (input.status) t.status = input.status;
         if (input.status === 'deleted') delete s.tasks[input.taskId];
+      }
+      addStep(s, step);
+      s.status = 'working';
+      if (p.tool_name === 'Agent' || p.tool_name === 'Task') {
+        s.agents.push({
+          key: newId(), id: null, type: input.subagent_type || 'general-purpose', description: input.description || '',
+          prompt: trunc(input.prompt || '', 4000), model: input.model || '', status: 'starting', toolUseId: p.tool_use_id,
+          parentKey: lane, startedAt: p._ts,
+        });
       }
       break;
     }
@@ -166,7 +216,7 @@ function processEvent(p) {
     case 'PostToolUseFailure': {
       const failed = ev === 'PostToolUseFailure';
       const step = findStep(s, p.tool_use_id);
-      const result = trunc(failed ? (p.error || summarizeResponse(p.tool_response)) : summarizeResponse(p.tool_response), 1500);
+      const result = trunc(failed ? (p.error || summarizeResponse(p.tool_response)) : summarizeResponse(p.tool_response), 3000);
       if (step) {
         step.status = failed ? 'failed' : 'done';
         step.result = result;
@@ -174,10 +224,14 @@ function processEvent(p) {
         pushStep(s, step);
       }
       const ag = s.agents.find(a => a.toolUseId && a.toolUseId === p.tool_use_id);
-      // Background agents return right away ("async launched"); they finish later on SubagentStop.
-      const launchedInBackground = /async|background|launched/i.test(typeof p.tool_response === 'string' ? p.tool_response : JSON.stringify(p.tool_response || ''));
-      if (ag && (failed || !launchedInBackground)) { ag.status = failed ? 'failed' : 'done'; ag.endedAt = p._ts; }
-      if (ag && step && launchedInBackground && !failed) { step.text = step.text.replace('Giao việc cho agent', 'Đã giao việc (chạy nền) cho agent'); step.result = 'Agent đang làm ở chế độ chạy nền.'; pushStep(s, step); }
+      if (ag) {
+        const f = agentFacts(p);
+        if (f.model) ag.resolvedModel = f.model;
+        if (f.agentId && !ag.id) ag.id = f.agentId;
+        if (failed) { ag.status = 'failed'; ag.endedAt = p._ts; ag.result = result; }
+        else if (f.background) ag.background = true; // finishes later, on SubagentStop / task notification
+        else { ag.status = 'done'; ag.endedAt = p._ts; ag.result = result; }
+      }
       if (p.tool_name === 'TaskCreate' && !failed) {
         const r = p.tool_response;
         const id = r?.task?.id || (/#(\d+)/.exec(typeof r === 'string' ? r : JSON.stringify(r || '')) || [])[1];
@@ -187,121 +241,45 @@ function processEvent(p) {
     }
     case 'SubagentStart': {
       const key = laneOf(s, p);
-      const ag = s.agents.find(a => a.key === key);
-      addStep(s, { kind: 'agent', mark: 'subagent-start', icon: '👥', lane: key, text: `Agent “${ag.type}” bắt đầu làm việc${ag.description ? ': ' + ag.description : ''}`, link: { type: 'agent', name: ag.type }, ts: p._ts });
+      addStep(s, { kind: 'agent', mark: 'subagent-start', lane: key, ts: p._ts });
       break;
     }
     case 'SubagentStop': {
-      const ag = s.agents.find(a => a.id === p.agent_id) || [...s.agents].reverse().find(a => a.status === 'working');
+      // Match strictly by id: other internal agents also fire SubagentStop and must not close the wrong lane.
+      const ag = p.agent_id ? s.agents.find(a => a.id === p.agent_id) : null;
       if (ag) {
-        ag.status = 'done'; ag.endedAt = p._ts;
-        addStep(s, { kind: 'agent', mark: 'subagent-end', icon: '✅', lane: ag.key, text: `Agent “${ag.type}” đã xong việc${ag.description ? ': ' + ag.description : ''}`, ts: p._ts });
+        if (ag.status !== 'failed') ag.status = 'done';
+        ag.endedAt = p._ts;
+        addStep(s, { kind: 'agent', mark: 'subagent-end', lane: ag.key, ts: p._ts });
       }
       break;
     }
     case 'Notification': {
       const msg = p.message || '';
       if (/waiting for your input/i.test(msg)) { if (s.status === 'working') s.status = 'done'; break; }
-      s.status = /permission|approval/i.test(msg) ? 'needs-permission' : 'waiting';
-      const text = /permission/i.test(msg) ? 'Đang chờ bạn cho phép trong cửa sổ Claude Code' : short(msg, 140);
-      addStep(s, { kind: 'system', mark: 'note', icon: '🔔', text, detail: msg, ts: p._ts });
+      s.status = 'waiting';
+      addStep(s, { kind: 'system', mark: 'waiting', text: /permission/i.test(msg) ? 'Đang chờ bạn cho phép trong cửa sổ Claude Code' : short(msg, 140), ts: p._ts });
       break;
     }
     case 'Stop':
       for (const st of s.steps) if (st.status === 'running' && !st.lane) { st.status = 'skipped'; pushStep(s, st); }
-      if (s.status !== 'stopped') s.status = 'done';
-      addStep(s, { kind: 'system', mark: 'turn-end', icon: '🏁', text: 'Xong lượt này · đang chờ bạn giao việc tiếp', ts: p._ts });
+      s.status = 'done';
+      addStep(s, { kind: 'system', mark: 'turn-end', ts: p._ts });
       break;
     case 'SessionEnd':
       s.status = 'ended';
-      addStep(s, { kind: 'system', mark: 'session-end', icon: '🚪', text: 'Phiên làm việc đã đóng', ts: p._ts });
       break;
     default: break;
   }
   return s;
 }
 
-function needsApproval(s, tool) {
-  if (!clients.size) return false; // nobody is looking at the dashboard: don't make the agent wait
-  if (NEVER_ASK.has(tool) || s.allowTools.includes(tool)) return false;
-  if (config.approvalMode === 'all') return true;
-  if (config.approvalMode === 'risky') return RISKY.has(tool);
-  return false;
-}
-
-function waitApproval(s, step, res) {
-  return new Promise(resolve => {
-    const id = newId();
-    const timeoutMs = Math.max(30, Number(config.approvalTimeoutSec) || 600) * 1000;
-    const a = {
-      id, stepId: step.id, sessionId: s.id, project: s.project, title: s.title, tool: step.tool, icon: step.icon,
-      text: step.text, detail: step.detail, who: laneName(s, step.lane), createdAt: Date.now(), expiresAt: Date.now() + timeoutMs,
-    };
-    step.status = 'awaiting';
-    s.status = 'approval';
-    const timer = setTimeout(() => finish(null), timeoutMs);
-    function finish(decision, note) {
-      if (!approvals.has(id)) return;
-      clearTimeout(timer);
-      approvals.delete(id);
-      s.status = [...approvals.values()].some(x => x.meta.sessionId === s.id) ? 'approval' : 'working';
-      if (decision === 'allow') {
-        step.status = 'running';
-        resolve({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'Đã được duyệt trên Bảng điều khiển Agent' } });
-      } else if (decision === 'deny') {
-        step.status = 'denied';
-        step.result = note ? `Bạn đã từ chối. Lý do: ${note}` : 'Bạn đã từ chối bước này.';
-        resolve({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: note ? `Người dùng từ chối bước này. Lý do: ${note}` : 'Người dùng đã từ chối bước này trên bảng điều khiển. Hãy chọn cách khác hoặc hỏi lại người dùng.' } });
-      } else {
-        step.status = 'running';
-        resolve({}); // timed out or Claude stopped waiting: fall back to Claude Code's normal behaviour
-      }
-      pushStep(s, step); pushSession(s); pushApprovals();
-    }
-    approvals.set(id, { meta: a, finish });
-    res.on('close', () => finish(null));
-    pushStep(s, step); pushSession(s); pushApprovals();
-  });
-}
-
-function takeMessages(s) {
-  const text = s.messages.map(m => `- ${m}`).join('\n');
-  s.messages = [];
-  addStep(s, { kind: 'system', mark: 'message', icon: '📨', text: 'Agent đã nhận lời nhắn của bạn' });
-  return `Người dùng vừa gửi lời nhắn qua Bảng điều khiển Agent. Hãy đọc và làm theo:\n${text}`;
-}
-
-async function handleHook(p, res) {
+function handleHook(p) {
   p._ts = Date.now();
   fs.appendFile(EVENTS_FILE, JSON.stringify(slim(p)) + '\n', () => {});
   const s = processEvent(p);
-  const ev = p.hook_event_name;
-  const step = ev === 'PreToolUse' ? findStep(s, p.tool_use_id) || s.steps[s.steps.length - 1] : null;
-  let out = {};
-
-  if (s.stopRequested && ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'SubagentStart'].includes(ev)) {
-    s.stopRequested = false;
-    s.status = 'stopped';
-    if (step) { step.status = 'denied'; step.result = 'Không làm vì bạn đã bấm Dừng.'; pushStep(s, step); }
-    addStep(s, { kind: 'system', mark: 'stopped', icon: '⏹️', text: 'Đã dừng theo yêu cầu của bạn' });
-    out = { continue: false, stopReason: 'Đã dừng từ Bảng điều khiển Agent' };
-    if (ev === 'PreToolUse') out.hookSpecificOutput = { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Người dùng đã bấm Dừng trên bảng điều khiển.' };
-  } else if (ev === 'Stop' && s.stopRequested) {
-    s.stopRequested = false;
-    s.status = 'stopped';
-  } else if (s.messages.length && (ev === 'PostToolUse' || ev === 'UserPromptSubmit')) {
-    out = { hookSpecificOutput: { hookEventName: ev, additionalContext: takeMessages(s) } };
-  } else if (s.messages.length && ev === 'Stop' && !p.stop_hook_active) {
-    s.status = 'working';
-    const last = s.steps[s.steps.length - 1];
-    if (last && last.mark === 'turn-end') { last.text = 'Agent định dừng nhưng làm tiếp theo lời nhắn của bạn'; last.icon = '↪️'; last.mark = 'note'; pushStep(s, last); }
-    out = { decision: 'block', reason: takeMessages(s) };
-  } else if (ev === 'PreToolUse' && step && needsApproval(s, p.tool_name)) {
-    pushSession(s);
-    out = await waitApproval(s, step, res);
-  }
   pushSession(s);
-  return out;
+  return {}; // never changes what Claude Code does
 }
 
 // ---------------------------------------------------------------- replay history on start
@@ -321,8 +299,9 @@ function replay() {
   }
   replaying = false;
   for (const s of sessions.values()) {
-    for (const st of s.steps) if (st.status === 'running' || st.status === 'awaiting') st.status = 'unknown';
-    if (['working', 'approval'].includes(s.status)) s.status = 'unknown';
+    for (const st of s.steps) if (st.status === 'running') st.status = 'unknown';
+    for (const a of s.agents) if (a.status === 'working' || a.status === 'starting') a.status = 'unknown';
+    if (['working', 'waiting'].includes(s.status)) s.status = 'unknown';
   }
 }
 
@@ -334,11 +313,8 @@ function projectDirs() {
 function stateSnapshot() {
   const list = [...sessions.values()].filter(s => !config.hidden.includes(s.id))
     .sort((a, b) => b.updatedAt - a.updatedAt)
-    .map(s => ({ ...meta(s), steps: s.steps.slice(-400) }));
-  return {
-    sessions: list, approvals: [...approvals.values()].map(a => a.meta),
-    config, hooks: claudeSettings.status(), mainModel: claudeSettings.getModel(),
-  };
+    .map(s => ({ ...meta(s), steps: s.steps.slice(-800) }));
+  return { sessions: list, config, hooks: claudeSettings.status(), mainModel: claudeSettings.getModel() };
 }
 
 function readBody(req, limit = 25 * 1024 * 1024) {
@@ -371,6 +347,7 @@ function serveStatic(req, res, pathname) {
 }
 
 const allowedHosts = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
+const MODEL_VALUES = ['', 'inherit', 'opus', 'sonnet', 'haiku', 'fable'];
 
 async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -383,10 +360,7 @@ async function route(req, res) {
   const m = (re) => re.exec(pathname);
   let r;
 
-  if (req.method === 'POST' && pathname === '/api/hook') {
-    const p = await readBody(req);
-    return json(res, 200, await handleHook(p, res));
-  }
+  if (req.method === 'POST' && pathname === '/api/hook') return json(res, 200, handleHook(await readBody(req)));
   if (req.method === 'GET' && pathname === '/api/stream') {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
     res.write(`data: ${JSON.stringify({ type: 'hello' })}\n\n`);
@@ -401,54 +375,30 @@ async function route(req, res) {
     const s = sessions.get(decodeURIComponent(r[1]));
     return s ? json(res, 200, { ...meta(s), steps: s.steps }) : json(res, 404, { error: 'Không tìm thấy phiên.' });
   }
-  if (req.method === 'POST' && (r = m(/^\/api\/approvals\/([^/]+)$/))) {
-    const body = await readBody(req);
-    const a = approvals.get(r[1]);
-    if (!a) return json(res, 404, { error: 'Yêu cầu này đã hết hạn hoặc đã được xử lý.' });
-    if (body.decision === 'always') {
-      const s = sessions.get(a.meta.sessionId);
-      if (s && !s.allowTools.includes(a.meta.tool)) s.allowTools.push(a.meta.tool);
-      a.finish('allow');
-    } else a.finish(body.decision === 'allow' ? 'allow' : 'deny', short(body.note || '', 500));
-    return json(res, 200, { ok: true });
-  }
-  if (req.method === 'POST' && (r = m(/^\/api\/sessions\/([^/]+)\/(stop|cancel-stop|message|hide|reset-trust)$/))) {
+  if (req.method === 'GET' && (r = m(/^\/api\/sessions\/([^/]+)\/file$/))) {
+    // Reads an output file, but only one this session itself wrote or edited (never any file on the machine).
     const s = sessions.get(decodeURIComponent(r[1]));
+    const want = url.searchParams.get('path') || '';
     if (!s) return json(res, 404, { error: 'Không tìm thấy phiên.' });
-    const action = r[2];
-    if (action === 'stop') {
-      s.stopRequested = true;
-      for (const a of [...approvals.values()]) if (a.meta.sessionId === s.id) a.finish('deny', 'Người dùng đã bấm Dừng.');
-      addStep(s, { kind: 'system', mark: 'note', icon: '✋', text: 'Bạn đã bấm Dừng · agent sẽ dừng ở bước kế tiếp' });
-    } else if (action === 'cancel-stop') {
-      s.stopRequested = false;
-      addStep(s, { kind: 'system', mark: 'note', icon: '↩️', text: 'Đã huỷ yêu cầu dừng' });
-    } else if (action === 'message') {
-      const body = await readBody(req);
-      const text = String(body.text || '').trim();
-      if (!text) return json(res, 400, { error: 'Lời nhắn đang trống.' });
-      s.messages.push(short(text, 2000));
-      addStep(s, { kind: 'system', mark: 'message', icon: '✉️', text: `Bạn nhắn: ${short(text, 140)} · agent sẽ đọc ở bước kế tiếp`, detail: text });
-    } else if (action === 'hide') {
-      if (!config.hidden.includes(s.id)) config.hidden.push(s.id);
-      config.hidden = config.hidden.slice(-500);
-      saveConfig();
-      send({ type: 'hidden', sessionId: s.id });
-      return json(res, 200, { ok: true });
-    } else if (action === 'reset-trust') {
-      s.allowTools = [];
-    }
-    pushSession(s);
+    const written = s.steps.some(x => ['Write', 'Edit', 'MultiEdit'].includes(x.tool) && String(x.detail || '').split('\n')[0] === want);
+    if (!written || !path.isAbsolute(want)) return json(res, 403, { error: 'Chỉ mở được file mà phiên này đã tạo hoặc sửa.' });
+    if (!/\.(md|markdown|txt|csv|json|html?)$/i.test(want)) return json(res, 415, { error: 'Chỉ xem được file văn bản (.md, .txt, .csv, .json).' });
+    let st;
+    try { st = fs.statSync(want); } catch { return json(res, 404, { error: 'File này không còn trên máy (có thể đã bị xoá hoặc đổi tên).' }); }
+    if (st.size > 2 * 1024 * 1024) return json(res, 413, { error: 'File quá lớn để xem ở đây.' });
+    return json(res, 200, { path: want, name: path.basename(want), text: fs.readFileSync(want, 'utf8'), mtime: st.mtimeMs });
+  }
+  if (req.method === 'POST' && (r = m(/^\/api\/sessions\/([^/]+)\/hide$/))) {
+    const id = decodeURIComponent(r[1]);
+    if (!config.hidden.includes(id)) config.hidden.push(id);
+    config.hidden = config.hidden.slice(-500);
+    saveConfig();
+    send({ type: 'hidden', sessionId: id });
     return json(res, 200, { ok: true });
   }
 
   if (req.method === 'GET' && pathname === '/api/items') return json(res, 200, { items: items.scan(projectDirs()) });
-  if (req.method === 'POST' && pathname === '/api/items/bulk-model') {
-    const body = await readBody(req);
-    items.scan(projectDirs());
-    return json(res, 200, { results: items.setModelMany(body.ids || [], body.model || '') });
-  }
-  if ((r = m(/^\/api\/items\/([0-9a-f]{12})(?:\/(history|restore|copy|version))?$/))) {
+  if ((r = m(/^\/api\/items\/([0-9a-f]{12})(?:\/(history|restore|copy|version|model))?$/))) {
     const [, id, sub] = r;
     if (!items.get(id)) items.scan(projectDirs());
     if (req.method === 'GET' && !sub) { const it = items.get(id); return it ? json(res, 200, it) : json(res, 404, { error: 'Không tìm thấy mục này.' }); }
@@ -460,6 +410,13 @@ async function route(req, res) {
     if (req.method === 'POST' && !sub) {
       const body = await readBody(req);
       const out = items.save(id, body.changes || {}, body.mtime);
+      return json(res, 200, { ...out, item: items.get(id) });
+    }
+    if (req.method === 'POST' && sub === 'model') { // one-click model change, used from the activity view and the cards
+      const body = await readBody(req);
+      const model = String(body.model || '');
+      if (!MODEL_VALUES.includes(model)) return json(res, 400, { error: 'Model không hợp lệ.' });
+      const out = items.save(id, { model });
       return json(res, 200, { ...out, item: items.get(id) });
     }
     if (req.method === 'POST' && sub === 'restore') {
@@ -477,8 +434,6 @@ async function route(req, res) {
   if (pathname === '/api/config') {
     if (req.method === 'POST') {
       const body = await readBody(req);
-      if (['watch', 'risky', 'all'].includes(body.approvalMode)) config.approvalMode = body.approvalMode;
-      if (Number(body.approvalTimeoutSec) >= 30) config.approvalTimeoutSec = Math.min(600, Number(body.approvalTimeoutSec));
       if (Array.isArray(body.extraProjects)) config.extraProjects = body.extraProjects.map(String).filter(d => fs.existsSync(d));
       saveConfig();
       send({ type: 'config', config });
@@ -504,7 +459,6 @@ const server = http.createServer((req, res) => {
     json(res, status, { error: status === 500 ? `Có lỗi xảy ra: ${err.message}` : err.message });
   });
 });
-server.requestTimeout = 0; // approval requests may wait several minutes
 server.headersTimeout = 60000;
 server.on('error', err => {
   if (err.code === 'EADDRINUSE') {
